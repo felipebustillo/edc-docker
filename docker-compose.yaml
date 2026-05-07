@@ -1,0 +1,270 @@
+###############################################################################
+# Standalone Tractus-X EDC — production posture
+#
+#   Caddy        TLS termination + Let's Encrypt
+#   Vault        production raft mode, persistent volume, scoped EDC token
+#   Postgres     persistent EDC state store
+#   EDC          control-plane + data-plane (tractusx-edc 0.12.0)
+#
+# Dataspace identity, directory, and credential issuance are NOT bundled —
+# provided by the dataspace operator.
+#
+# Bootstrap (one time):
+#   ./scripts/setup.sh hanka            # generate .env from preset
+#   <edit .env>
+#   docker compose up -d --wait vault
+#   docker compose run --rm vault-init
+#   docker compose cp vault-init:/vault/state/init.json ./vault-init.json
+#   # back up vault-init.json off-host, then delete it locally
+#   ./scripts/up.sh
+#
+# Day-to-day:
+#   ./scripts/up.sh                     # safe in any state (cold/warm/post-restart)
+#   docker compose logs -f controlplane
+#   docker compose down                 # stop, keep volumes
+#
+# See docs/ONBOARDING.md for the full procedure and docs/LIMITATIONS.md for
+# the (deliberate) limitations of this single-node stack.
+###############################################################################
+
+x-java-env: &java-env
+    JAVA_TOOL_OPTIONS: "${JAVA_TOOL_OPTIONS:--Xmx512m}"
+
+services:
+    # --- HTTPS termination ---------------------------------------------------
+    caddy:
+        image: caddy:2.11.2-alpine
+        restart: unless-stopped
+        ports:
+            - "80:80"
+            - "443:443"
+        volumes:
+            - ./config/Caddyfile:/etc/caddy/Caddyfile:ro
+            - caddy-data:/data
+            - caddy-config:/config
+        environment:
+            EDC_PUBLIC_HOST: ${EDC_PUBLIC_HOST}
+            ACME_EMAIL: ${ACME_EMAIL}
+        depends_on:
+            controlplane:
+                condition: service_healthy
+            dataplane:
+                condition: service_healthy
+
+    # --- PostgreSQL ----------------------------------------------------------
+    postgres:
+        image: postgres:17.9-alpine
+        restart: unless-stopped
+        environment:
+            POSTGRES_USER: ${POSTGRES_USER}
+            POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+            POSTGRES_DB: edc
+        volumes:
+            - postgres-data:/var/lib/postgresql/data
+        healthcheck:
+            test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
+            interval: 5s
+            timeout: 3s
+            retries: 10
+
+    # --- HashiCorp Vault (production raft) -----------------------------------
+    vault:
+        image: hashicorp/vault:1.21.4
+        restart: unless-stopped
+        cap_add: [IPC_LOCK]
+        command: ["vault", "server", "-config=/vault/config/config.hcl"]
+        volumes:
+            - ./config/vault.hcl:/vault/config/config.hcl:ro
+            - vault-data:/vault/data
+        environment:
+            VAULT_ADDR: "http://127.0.0.1:8200"
+        healthcheck:
+            test:
+                - "CMD"
+                - "wget"
+                - "-qO-"
+                - "http://127.0.0.1:8200/v1/sys/health?standbyok=true&sealedcode=200&uninitcode=200"
+            interval: 5s
+            timeout: 3s
+            retries: 30
+
+    # --- Vault init / unseal / seed (runs to completion on every up) ---------
+    vault-init:
+        image: hashicorp/vault:1.21.4
+        restart: "no"
+        # Root is required to install jq via apk on first run and to write the
+        # bind-mounted runtime/edc-vault.env. Vault itself never runs as root.
+        user: "0"
+        environment:
+            VAULT_ADDR: "http://vault:8200"
+            STS_CLIENT_SECRET: "${STS_CLIENT_SECRET}"
+            TOKEN_SIGNER_KEY_JWK: "${TOKEN_SIGNER_KEY_JWK}"
+            EDC_TOKEN_PERIOD: "${EDC_TOKEN_PERIOD:-720h}"
+        volumes:
+            - vault-state:/vault/state
+            - ./scripts/vault-init.sh:/usr/local/bin/vault-init.sh:ro
+            - ./runtime:/host-runtime
+        entrypoint: ["/bin/sh", "-c"]
+        # After the bulk of the work is done by vault-init.sh, copy the produced
+        # env file into the bind-mounted ./runtime so that EDC services can pick
+        # it up via env_file on the next compose call.
+        command:
+            - |
+                set -eu
+                /bin/sh /usr/local/bin/vault-init.sh
+                cp /vault/state/edc-vault.env /host-runtime/edc-vault.env
+                chmod 644 /host-runtime/edc-vault.env
+        depends_on:
+            vault:
+                condition: service_healthy
+
+    # --- EDC control-plane ---------------------------------------------------
+    controlplane:
+        image: tractusx/edc-controlplane-postgresql-hashicorp-vault:${EDC_VERSION}
+        restart: unless-stopped
+        volumes:
+            - ./config/edc-logging.properties:/app/logging.properties:ro
+        env_file:
+            - path: ./runtime/edc-vault.env
+              required: false
+        environment:
+            <<: *java-env
+
+            # --- Identity ---
+            EDC_HOSTNAME: "${EDC_HOSTNAME:-controlplane}"
+            EDC_PARTICIPANT_ID: "${EDC_DID}"
+            EDC_PARTICIPANT_CONTEXT_ID: "${EDC_PARTICIPANT_CONTEXT_ID}"
+            TRACTUSX_EDC_PARTICIPANT_BPN: "${EDC_BPN}"
+            EDC_IAM_ISSUER_ID: "${EDC_DID}"
+            EDC_IAM_DID_WEB_USE_HTTPS: "true"
+            EDC_IAM_ACCESSTOKEN_JTI_VALIDATION: "false"
+
+            # --- STS (single-step RemoteSecureTokenService) ---
+            EDC_IAM_STS_OAUTH_TOKEN_URL: "${STS_TOKEN_URL}"
+            EDC_IAM_STS_OAUTH_CLIENT_ID: "${EDC_DID}"
+            EDC_IAM_STS_OAUTH_CLIENT_SECRET_ALIAS: "sts-oauth-client-secret"
+
+            # --- Credential service ---
+            TX_EDC_IAM_IATP_CREDENTIALSERVICE_URL: "${CREDENTIAL_SERVICE_URL}"
+
+            # --- Default IATP scopes ---
+            TX_EDC_IAM_IATP_DEFAULT_SCOPES_MEMBERSHIP_ALIAS: "org.eclipse.tractusx.vc.type"
+            TX_EDC_IAM_IATP_DEFAULT_SCOPES_MEMBERSHIP_TYPE: "MembershipCredential"
+            TX_EDC_IAM_IATP_DEFAULT_SCOPES_MEMBERSHIP_OPERATION: "read"
+            TX_EDC_IAM_IATP_DEFAULT_SCOPES_DATAEXCHANGE_ALIAS: "org.eclipse.tractusx.vc.type"
+            TX_EDC_IAM_IATP_DEFAULT_SCOPES_DATAEXCHANGE_TYPE: "DataExchangeGovernanceCredential"
+            TX_EDC_IAM_IATP_DEFAULT_SCOPES_DATAEXCHANGE_OPERATION: "read"
+
+            # --- DSP callback (HTTPS, advertised to peers) ---
+            EDC_DSP_CALLBACK_ADDRESS: "${EDC_DSP_CALLBACK_ADDRESS}"
+
+            # --- BDRS ---
+            TX_EDC_IAM_IATP_BDRS_SERVER_URL: "${BDRS_URL}"
+            TX_EDC_IAM_IATP_BDRS_CACHE_VALIDITY: "600"
+
+            # --- DCP ---
+            TX_EDC_DID_SERVICE_SELF_REGISTRATION_ENABLED: "false"
+
+            # --- Trusted issuers ---
+            "EDC_IAM_TRUSTED-ISSUER_0-ISSUER_ID": "${TRUSTED_ISSUER_DID}"
+            "EDC_IAM_TRUSTED-ISSUER_0-ISSUER_SUPPORTEDTYPES": '["MembershipCredential","FrameworkCredential","BpnCredential","DataExchangeGovernanceCredential","DismantlerCredential"]'
+
+            # --- Web endpoints ---
+            WEB_HTTP_PORT: "8080"
+            WEB_HTTP_PATH: "/api"
+            WEB_HTTP_MANAGEMENT_PORT: "8081"
+            WEB_HTTP_MANAGEMENT_PATH: "/management"
+            WEB_HTTP_MANAGEMENT_AUTH_KEY: "${EDC_API_KEY}"
+            WEB_HTTP_CATALOG_PORT: "8082"
+            WEB_HTTP_CATALOG_PATH: "/catalog"
+            WEB_HTTP_CONTROL_PORT: "8083"
+            WEB_HTTP_CONTROL_PATH: "/control"
+            WEB_HTTP_PROTOCOL_PORT: "8084"
+            WEB_HTTP_PROTOCOL_PATH: "/api/v1/dsp"
+            WEB_HTTP_VERSION_PORT: "8085"
+            WEB_HTTP_VERSION_PATH: "/.well-known/api"
+
+            # --- Database ---
+            EDC_DATASOURCE_DEFAULT_URL: "jdbc:postgresql://postgres:5432/edc"
+            EDC_DATASOURCE_DEFAULT_USER: "${POSTGRES_USER}"
+            EDC_DATASOURCE_DEFAULT_PASSWORD: "${POSTGRES_PASSWORD}"
+
+            # --- Vault (URL + secret path; the token comes from env_file) ---
+            EDC_VAULT_HASHICORP_URL: "http://vault:8200"
+            EDC_VAULT_HASHICORP_API_SECRET_PATH: "/v1/secret"
+        ports:
+            # Management API: localhost-only. Use SSH port-forwarding or a
+            # private VPN to reach it from another host.
+            - "127.0.0.1:${EDC_MANAGEMENT_HOST_PORT:-29181}:8081"
+        healthcheck:
+            test: ["CMD-SHELL", "wget -q --spider http://localhost:8080/api/check/health || exit 1"]
+            interval: 10s
+            timeout: 5s
+            retries: 30
+            start_period: 30s
+        depends_on:
+            postgres:
+                condition: service_healthy
+            vault-init:
+                condition: service_completed_successfully
+
+    # --- EDC data-plane ------------------------------------------------------
+    dataplane:
+        image: tractusx/edc-dataplane-hashicorp-vault:${EDC_VERSION}
+        restart: unless-stopped
+        env_file:
+            - path: ./runtime/edc-vault.env
+              required: false
+        environment:
+            <<: *java-env
+
+            EDC_HOSTNAME: "${EDC_HOSTNAME:-controlplane}"
+            EDC_PARTICIPANT_ID: "${EDC_BPN}"
+            EDC_PARTICIPANT_CONTEXT_ID: "${EDC_PARTICIPANT_CONTEXT_ID}"
+            EDC_IAM_ISSUER_ID: "${EDC_DID}"
+            EDC_IAM_DID_WEB_USE_HTTPS: "true"
+
+            EDC_IAM_STS_OAUTH_TOKEN_URL: "${STS_TOKEN_URL}"
+            EDC_IAM_STS_OAUTH_CLIENT_ID: "${EDC_DID}"
+            EDC_IAM_STS_OAUTH_CLIENT_SECRET_ALIAS: "sts-oauth-client-secret"
+
+            WEB_HTTP_PORT: "8080"
+            WEB_HTTP_PATH: "/api"
+            WEB_HTTP_PUBLIC_PORT: "8081"
+            WEB_HTTP_PUBLIC_PATH: "/api/public"
+            WEB_HTTP_CONTROL_PORT: "8083"
+            WEB_HTTP_CONTROL_PATH: "/api/dataplane/control"
+            WEB_HTTP_VERSION_PORT: "8084"
+            WEB_HTTP_VERSION_PATH: "/.well-known/api"
+
+            EDC_DATAPLANE_API_PUBLIC_BASEURL: "${EDC_DATAPLANE_PUBLIC_URL}"
+            EDC_TRANSFER_PROXY_TOKEN_SIGNER_PRIVATEKEY_ALIAS: "token-signer-key"
+            EDC_TRANSFER_PROXY_TOKEN_VERIFIER_PUBLICKEY_ALIAS: "token-signer-key"
+            EDC_DPF_SELECTOR_URL: "http://controlplane:8083/control/v1/dataplanes"
+
+            EDC_DATASOURCE_DEFAULT_URL: "jdbc:postgresql://postgres:5432/edc"
+            EDC_DATASOURCE_DEFAULT_USER: "${POSTGRES_USER}"
+            EDC_DATASOURCE_DEFAULT_PASSWORD: "${POSTGRES_PASSWORD}"
+
+            EDC_VAULT_HASHICORP_URL: "http://vault:8200"
+            EDC_VAULT_HASHICORP_API_SECRET_PATH: "/v1/secret"
+        healthcheck:
+            test: ["CMD-SHELL", "wget -q --spider http://localhost:8080/api/check/startup || exit 1"]
+            interval: 10s
+            timeout: 5s
+            retries: 30
+            start_period: 30s
+        depends_on:
+            postgres:
+                condition: service_healthy
+            vault-init:
+                condition: service_completed_successfully
+            controlplane:
+                condition: service_healthy
+
+volumes:
+    postgres-data:
+    vault-data:
+    vault-state:
+    caddy-data:
+    caddy-config:

@@ -1,0 +1,34 @@
+# Caddy reverse proxy with automatic HTTPS (Let's Encrypt).
+#
+# Two paths are exposed publicly:
+#   /api/v1/dsp   -> control-plane DSP protocol
+#   /api/public   -> data-plane public endpoint
+#
+# Everything else (management API, control API) stays on the docker network.
+
+{
+    email {$ACME_EMAIL}
+}
+
+{$EDC_PUBLIC_HOST} {
+    encode gzip
+
+    @dsp path /api/v1/dsp /api/v1/dsp/*
+    handle @dsp {
+        reverse_proxy controlplane:8084
+    }
+
+    @public path /api/public /api/public/*
+    handle @public {
+        reverse_proxy dataplane:8081
+    }
+
+    handle {
+        respond "not found" 404
+    }
+
+    log {
+        output stdout
+        format console
+    }
+}

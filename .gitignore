@@ -1,0 +1,23 @@
+# Real env files (only *.example is committed)
+.env
+.env.*
+!*.example
+
+# Vault bootstrap output (must be backed up off-host, never committed)
+vault-init.json
+
+# Runtime state written by vault-init (token env file). Keep the directory
+# tracked but ignore its contents.
+runtime/*
+!runtime/.gitkeep
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
