@@ -67,6 +67,19 @@ services:
             timeout: 3s
             retries: 10
 
+    # --- One-shot: ensure vault-data is owned by the vault user --------------
+    # Docker creates named volumes as root:root by default, but the official
+    # hashicorp/vault image runs as the unprivileged "vault" user — without
+    # this chown the raft store fails on first boot with "permission denied".
+    # Idempotent: re-running on an already-owned volume is a no-op.
+    vault-permissions:
+        image: hashicorp/vault:1.21.4
+        restart: "no"
+        user: "0"
+        entrypoint: ["chown", "-R", "vault:vault", "/vault/data"]
+        volumes:
+            - vault-data:/vault/data
+
     # --- HashiCorp Vault (production raft) -----------------------------------
     vault:
         image: hashicorp/vault:1.21.4
@@ -87,6 +100,9 @@ services:
             interval: 5s
             timeout: 3s
             retries: 30
+        depends_on:
+            vault-permissions:
+                condition: service_completed_successfully
 
     # --- Vault init / unseal / seed (runs to completion on every up) ---------
     vault-init:
