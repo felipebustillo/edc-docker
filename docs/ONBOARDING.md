@@ -39,49 +39,12 @@ Caddy in this stack will issue the certificate for `<your-public-host>` automati
   - peer EDCs you want to talk to (DSP)
 - [ ] At least 4 GiB of free RAM and 10 GiB of disk on the host.
 
-### 1.2 From the dataspace operator
+### 1.2 Generate the data-plane signer keypair
 
-The default preset targets [Hanka](https://hanka.ai). Sign up there to get a participant context provisioned. If you target a different Tractus-X dataspace, the procedure is the same — replace the operator endpoints in `.env`.
-
-When you onboard with the operator, they will need from **you**:
-
-- The **DSP URL** you plan to expose: `https://<your-public-host>/api/v1/dsp`.
-- The **public data-plane URL**: `https://<your-public-host>/api/public`.
-- The **public half** of your token-signer key (an Ed25519 JWK with the `d` field stripped). Generate it with the recipe below before contacting them.
-
-They will give **you** back a one-time onboarding bundle. The eight values
-in the bundle map to environment variables in `.env`:
-
-| Value (operator's name) | `.env` key | Notes |
-|---|---|---|
-| BPN | `EDC_BPN` | Your Business Partner Number, e.g. `BPNL00000003XXXX`. |
-| DID | `EDC_DID` | Usually `did:web:<their-host>:<your-BPN>`. The operator hosts the `did.json`. |
-| STS token URL | `STS_TOKEN_URL` | OAuth endpoint where you mint access tokens; for Hanka it's `https://identityhub.hanka.ai/api/sts/token`. |
-| STS client_id | `EDC_IAM_STS_OAUTH_CLIENT_ID` | **Must be your DID**, not your BPN. Mismatch shows up later as IH `401 invalid_client`. |
-| STS client_secret | `STS_CLIENT_SECRET` | The OAuth secret. Set once in vault; you'll never see it again. |
-| Credential service URL | `CREDENTIAL_SERVICE_URL` | Public URL the operator's IH publishes for *your* holder. Hanka: `https://identityhub.hanka.ai/api/credentials/v1/participants/<base64 BPN, no padding>`. |
-| BDRS directory URL | `BDRS_URL` | The BPN-DID resolution service. Hanka: `https://bdrs.hanka.ai/api/directory`. |
-| Trusted-issuer DID | `TRUSTED_ISSUER_DID` | DID of the operator's credential issuer; for Hanka `did:web:identityhub.hanka.ai:BPNL00000003CRHK`. |
-
-The operator must also confirm two things on **their** side before your
-connector will work:
-
-1. **Your token-signer public key is published in your DID document.** Check
-   with `curl https://<their-host>/<your-BPN>/did.json | jq` after they say
-   they're done — the JWK you sent should be listed under
-   `verificationMethod`.
-2. **A `MembershipCredential` (and ideally a `DataExchangeGovernanceCredential`)
-   has been issued to your holder.** Without these, peer verifiers can't
-   prove anything about you and catalog requests will come back empty or
-   fail with `403 Invalid query: requested Credentials outside of scope`.
-
-For Hanka, the operator endpoints are already filled in `presets/hanka.env.example`. For other dataspaces, ask the operator for them explicitly.
-
-### 1.3 Generate the token-signer keypair
-
-The data-plane signs proxy tokens with this key. The **private** half goes into vault. The **public** half goes into your DID document hosted by the operator.
-
-Run on the host:
+The data-plane signs proxy tokens with this key. The **private** half stays
+on this host (in vault, populated from `.env`). The **public** half goes
+into your DID document at the operator. Generate both halves locally —
+the private key never leaves the host:
 
 ```bash
 # 1. Ed25519 private key in PEM
@@ -96,6 +59,8 @@ from jwcrypto import jwk
 k = jwk.JWK.from_pem(open("signer.pem","rb").read())
 priv = json.loads(k.export(private_key=True))
 pub  = json.loads(k.export(private_key=False))
+# Force a kid so the operator can wire the verificationMethod predictably.
+# Use any stable label; "#data-plane" is the convention used by Hanka.
 print("PRIVATE:", json.dumps(priv))
 print("PUBLIC :", json.dumps(pub))
 PY
@@ -105,13 +70,92 @@ PY
 Take note of:
 
 - The **PRIVATE** JWK — you'll paste it in `.env` as `TOKEN_SIGNER_KEY_JWK`.
-- The **PUBLIC** JWK — you'll send it to the operator. Once they confirm it's in your DID document, proceed.
+- The **PUBLIC** JWK — you'll paste it into the operator's portal.
 
-Once you've sent the public JWK, **delete `signer.pem`**:
+When pasting the public JWK make sure it has a `kid` field. If the recipe
+above didn't set one, add it manually using the convention
+`<your-DID>#data-plane` (you'll know your DID after registering; for the
+first registration you can use `<your-host>#data-plane` as a placeholder
+and edit the `kid` to match once Hanka has assigned your DID).
+
+After you've captured both halves, shred the PEM:
 
 ```bash
 shred -u signer.pem
 ```
+
+### 1.3 Register your connector with the dataspace operator
+
+The default preset targets [Hanka](https://hanka.ai), which provides a
+self-service registration flow. Other Tractus-X operators (Cofinity-X,
+custom installs) still use the manual exchange described in §1.3.b.
+
+#### 1.3.a Hanka (self-service)
+
+1. Sign in to the Hanka portal and open **Services → EDC → Connectors**
+   (or the empty-state choice screen on first use).
+2. Pick **Company-managed**.
+3. Fill the form:
+   - **Name** — anything readable (e.g. `edc-docker (Tailscale)`).
+   - **Public host** — the hostname only, no scheme, no path. Hanka
+     derives the DSP and data-plane URLs from it.
+   - **Location** — optional label (e.g. `DE / on-prem`).
+   - **Data-plane signer public JWK** — paste the PUBLIC JWK from §1.2.
+4. Submit. Hanka returns a one-time bundle with everything your `.env`
+   needs and synchronously publishes the public JWK in your DID document.
+   The `STS_CLIENT_SECRET` is shown only here — copy it now.
+
+Each row in the post-registration table maps 1:1 to an `.env` key, and
+the right-hand pane gives you the same content as a paste-ready
+`.env` block.
+
+| Value (portal label) | `.env` key | Notes |
+|---|---|---|
+| BPN | `EDC_BPN` | Your Business Partner Number, e.g. `BPNL00000003XXXX`. |
+| DID | `EDC_DID` | `did:web:identityhub.hanka.ai:<your-BPN>`. Hanka hosts the `did.json`. |
+| Public host | `EDC_PUBLIC_HOST` | The hostname you typed in the form. |
+| DSP callback | `EDC_DSP_CALLBACK_ADDRESS` | `https://<host>/api/v1/dsp`. |
+| Data-plane public URL | `EDC_DATAPLANE_PUBLIC_URL` | `https://<host>/api/public`. |
+| STS token URL | `STS_TOKEN_URL` | `https://identityhub.hanka.ai/api/sts/token`. |
+| STS client_id | `EDC_IAM_STS_OAUTH_CLIENT_ID` | **Your DID**, not your BPN. Mismatch shows up later as IH `401 invalid_client`. |
+| STS client_secret | `STS_CLIENT_SECRET` | The OAuth secret. Shown once; persist it now. |
+| Credential service URL | `CREDENTIAL_SERVICE_URL` | `https://identityhub.hanka.ai/api/credentials/v1/participants/<base64 BPN, no padding>`. |
+| BDRS directory URL | `BDRS_URL` | `https://bdrs.hanka.ai/api/directory`. |
+| Trusted-issuer DID | `TRUSTED_ISSUER_DID` | `did:web:identityhub.hanka.ai:BPNL00000003CRHK`. |
+
+Verify your data-plane key is published in the DID document before
+bringing up the stack:
+
+```bash
+curl -sS https://identityhub.hanka.ai/<your-BPN>/did.json \
+    | jq '.verificationMethod[] | .id'
+# Expect at least two entries: <DID>#key-1 (Hanka-managed STS key)
+# and the kid from the JWK you pasted (e.g. <DID>#data-plane).
+```
+
+Hanka also automatically issues a `MembershipCredential`, `BpnCredential`
+and `DataExchangeGovernanceCredential` to your holder as part of the
+onboarding pipeline — no manual step required.
+
+#### 1.3.b Other operators (manual flow)
+
+If you target a Tractus-X operator without a self-service portal you
+follow the old exchange:
+
+- Send the operator your DSP URL (`https://<your-public-host>/api/v1/dsp`),
+  data-plane URL (`https://<your-public-host>/api/public`) and the PUBLIC
+  JWK from §1.2.
+- The operator replies with the eight values from the table above (minus
+  the three derived URLs you already know).
+- The operator must also confirm two things before the connector will work:
+  1. Your token-signer public key is published in your DID document.
+     Check with `curl https://<their-host>/<your-BPN>/did.json | jq`.
+  2. A `MembershipCredential` (and ideally a
+     `DataExchangeGovernanceCredential`) has been issued to your holder.
+
+For Hanka, the operator endpoints are already filled in
+`presets/hanka.env.example`. For other dataspaces, ask the operator for
+them explicitly.
 
 ---
 
@@ -130,24 +174,31 @@ cd edc-docker
 ./scripts/setup.sh hanka          # or:  ./scripts/setup.sh cofinity
 ```
 
-Edit `.env` and fill in **every empty value**. Use the table from §1.2.
+Edit `.env` and fill in **every empty value**. Use the table from §1.3.a
+(Hanka self-service) or §1.3.b (manual flow).
 
 ```bash
 $EDITOR .env
 ```
 
-If `CREDENTIAL_SERVICE_URL` in your preset contains the placeholder `<BASE64_BPN>`, replace it with the base64 (no padding) of your BPN:
+For the Hanka flow, paste the `env_block` returned by the portal — every
+value including `EDC_DSP_CALLBACK_ADDRESS`, `EDC_DATAPLANE_PUBLIC_URL` and
+the base64-encoded `CREDENTIAL_SERVICE_URL` is already filled in.
 
-```bash
-echo -n "$(grep EDC_BPN .env | cut -d= -f2)" | base64 | tr -d '='
-```
-
-Also fill in:
+For the manual flow, the operator gives you the eight wallet values and
+you fill the derived URLs yourself:
 
 ```bash
 # These are public URLs Caddy will serve:
 EDC_DSP_CALLBACK_ADDRESS=https://<your-public-host>/api/v1/dsp
 EDC_DATAPLANE_PUBLIC_URL=https://<your-public-host>/api/public
+```
+
+If `CREDENTIAL_SERVICE_URL` in your preset contains the placeholder
+`<BASE64_BPN>`, replace it with the base64 (no padding) of your BPN:
+
+```bash
+echo -n "$(grep EDC_BPN .env | cut -d= -f2)" | base64 | tr -d '='
 ```
 
 ### 2.2 Bootstrap vault (one time only)
@@ -392,7 +443,7 @@ java.net.UnknownHostException: identity-hub.hanka.ai: Name does not resolve
 
 The DID in your `.env` references a hostname that doesn't exist (or
 has been renamed). Re-check `EDC_DID` and `CREDENTIAL_SERVICE_URL`
-against §1.2 — the operator may have changed their public hostname.
+against §1.3 — the operator may have changed their public hostname.
 For Hanka the canonical host is `identityhub.hanka.ai` (no dash).
 
 ### 6.3 `403 Invalid query: requested Credentials outside of scope`
@@ -426,13 +477,21 @@ configured, the inner token is non-null.
 
 The credential types the peer requests must match what the operator
 has actually issued into your holder. For Hanka the issued set is
-`MembershipCredential` + `DataExchangeGovernanceCredential`; ask the
-operator to confirm both are present in your holder before debugging
-further. The `config/edc-config.properties` here defines exactly that
-pair — if the operator issues more (or differently named) credential
-types, extend the file accordingly. **Never** request a credential
-type the operator does not issue: the IH returns "more credentials
-requested than returned" and the catalog fails outright.
+`MembershipCredential` + `BpnCredential` + `DataExchangeGovernanceCredential`,
+issued automatically by the onboarding pipeline; confirm they are present
+in your holder with:
+
+```bash
+curl -sS https://identityhub.hanka.ai/api/credentials/v1/participants/<base64-BPN>/credentials \
+    | jq '.[].type'
+```
+
+The `config/edc-config.properties` here defines exactly the
+`MembershipCredential` + `DataExchangeGovernanceCredential` pair — if the
+operator issues more (or differently named) credential types, extend the
+file accordingly. **Never** request a credential type the operator does
+not issue: the IH returns "more credentials requested than returned" and
+the catalog fails outright.
 
 See also [`LIMITATIONS.md`](LIMITATIONS.md) for known issues that this
 single-node stack will never fix.
