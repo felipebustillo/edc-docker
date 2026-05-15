@@ -140,11 +140,23 @@ services:
         restart: unless-stopped
         volumes:
             - ./config/edc-logging.properties:/app/logging.properties:ro
+            # Hyphenated config keys (e.g. tx.edc.iam.iatp.default-scopes.*)
+            # cannot be represented as environment variables — the EDC's
+            # env-var translator turns "_" into ".", not "-". Mounting them
+            # via a properties file is the only way the DCP extension reads
+            # them. Without this the connector mints STS tokens without
+            # scopes and verifying peers reject Presentation Queries with
+            # HTTP 403 "Invalid query: requested Credentials outside of
+            # scope." See docs/ONBOARDING.md §Scopes.
+            - ./config/edc-config.properties:/app/configuration.properties:ro
         env_file:
             - path: ./runtime/edc-vault.env
               required: false
         environment:
             <<: *java-env
+
+            # --- File-backed config (hyphenated keys) ---
+            EDC_FS_CONFIG: "/app/configuration.properties"
 
             # --- Identity ---
             EDC_HOSTNAME: "${EDC_HOSTNAME:-controlplane}"
@@ -164,12 +176,9 @@ services:
             TX_EDC_IAM_IATP_CREDENTIALSERVICE_URL: "${CREDENTIAL_SERVICE_URL}"
 
             # --- Default IATP scopes ---
-            TX_EDC_IAM_IATP_DEFAULT_SCOPES_MEMBERSHIP_ALIAS: "org.eclipse.tractusx.vc.type"
-            TX_EDC_IAM_IATP_DEFAULT_SCOPES_MEMBERSHIP_TYPE: "MembershipCredential"
-            TX_EDC_IAM_IATP_DEFAULT_SCOPES_MEMBERSHIP_OPERATION: "read"
-            TX_EDC_IAM_IATP_DEFAULT_SCOPES_DATAEXCHANGE_ALIAS: "org.eclipse.tractusx.vc.type"
-            TX_EDC_IAM_IATP_DEFAULT_SCOPES_DATAEXCHANGE_TYPE: "DataExchangeGovernanceCredential"
-            TX_EDC_IAM_IATP_DEFAULT_SCOPES_DATAEXCHANGE_OPERATION: "read"
+            # NOTE: scopes live in config/edc-config.properties because the
+            # key `tx.edc.iam.iatp.default-scopes.*` contains a hyphen that
+            # cannot be expressed as an environment variable.
 
             # --- DSP callback (HTTPS, advertised to peers) ---
             EDC_DSP_CALLBACK_ADDRESS: "${EDC_DSP_CALLBACK_ADDRESS}"

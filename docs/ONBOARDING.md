@@ -49,13 +49,31 @@ When you onboard with the operator, they will need from **you**:
 - The **public data-plane URL**: `https://<your-public-host>/api/public`.
 - The **public half** of your token-signer key (an Ed25519 JWK with the `d` field stripped). Generate it with the recipe below before contacting them.
 
-They will give **you** back:
+They will give **you** back a one-time onboarding bundle. The eight values
+in the bundle map to environment variables in `.env`:
 
-- [ ] **BPN** — your Business Partner Number, e.g. `BPNL00000003XXXX`.
-- [ ] **DID** — typically `did:web:<their-host>:<your-BPN>`. They host the `did.json`.
-- [ ] **STS client secret** — the OAuth secret your connector uses to talk to their STS.
-- [ ] **Trusted-issuer DID** — the DID of their credential issuer (you'll set it as `TRUSTED_ISSUER_DID`).
-- [ ] **Confirmation** that they've published your token-signer public key in your DID document.
+| Value (operator's name) | `.env` key | Notes |
+|---|---|---|
+| BPN | `EDC_BPN` | Your Business Partner Number, e.g. `BPNL00000003XXXX`. |
+| DID | `EDC_DID` | Usually `did:web:<their-host>:<your-BPN>`. The operator hosts the `did.json`. |
+| STS token URL | `STS_TOKEN_URL` | OAuth endpoint where you mint access tokens; for Hanka it's `https://identityhub.hanka.ai/api/sts/token`. |
+| STS client_id | `EDC_IAM_STS_OAUTH_CLIENT_ID` | **Must be your DID**, not your BPN. Mismatch shows up later as IH `401 invalid_client`. |
+| STS client_secret | `STS_CLIENT_SECRET` | The OAuth secret. Set once in vault; you'll never see it again. |
+| Credential service URL | `CREDENTIAL_SERVICE_URL` | Public URL the operator's IH publishes for *your* holder. Hanka: `https://identityhub.hanka.ai/api/credentials/v1/participants/<base64 BPN, no padding>`. |
+| BDRS directory URL | `BDRS_URL` | The BPN-DID resolution service. Hanka: `https://bdrs.hanka.ai/api/directory`. |
+| Trusted-issuer DID | `TRUSTED_ISSUER_DID` | DID of the operator's credential issuer; for Hanka `did:web:identityhub.hanka.ai:BPNL00000003CRHK`. |
+
+The operator must also confirm two things on **their** side before your
+connector will work:
+
+1. **Your token-signer public key is published in your DID document.** Check
+   with `curl https://<their-host>/<your-BPN>/did.json | jq` after they say
+   they're done — the JWK you sent should be listed under
+   `verificationMethod`.
+2. **A `MembershipCredential` (and ideally a `DataExchangeGovernanceCredential`)
+   has been issued to your holder.** Without these, peer verifiers can't
+   prove anything about you and catalog requests will come back empty or
+   fail with `403 Invalid query: requested Credentials outside of scope`.
 
 For Hanka, the operator endpoints are already filled in `presets/hanka.env.example`. For other dataspaces, ask the operator for them explicitly.
 
@@ -285,7 +303,46 @@ In that mode, your edge needs:
 
 ## 5. Verifying compatibility with Hanka
 
-After §2.3, ask the Hanka operator to do a catalog request against your connector:
+After §2.3, two checks isolate the most common failure modes before
+they bite during a real catalog request.
+
+### 5.1 STS smoke-test (does your connector authenticate?)
+
+Mint a token by hand and confirm the inner `token` claim is present.
+Replace `<peer DID>` with any peer you'd talk to (e.g. Hanka's
+provider DID `did:web:identityhub.hanka.ai:BPNL00000003AYRE`):
+
+```bash
+RESP=$(curl -sX POST \
+    -H 'Content-Type: application/x-www-form-urlencoded' \
+    -d "audience=<peer DID>\
+&grant_type=client_credentials\
+&client_id=$(grep ^EDC_DID .env | cut -d= -f2)\
+&client_secret=$(grep ^STS_CLIENT_SECRET .env | cut -d= -f2)\
+&bearer_access_scope=org.eclipse.tractusx.vc.type:MembershipCredential:read" \
+    "$(grep ^STS_TOKEN_URL .env | cut -d= -f2)")
+
+echo "$RESP" | python3 -c '
+import sys, json, base64
+out = json.load(sys.stdin)
+def dec(s): s += "="*(-len(s)%4); return json.loads(base64.urlsafe_b64decode(s))
+outer = dec(out["access_token"].split(".")[1])
+print("outer claims :", sorted(outer.keys()))
+if "token" not in outer:
+    print("FAIL — no inner token. Scopes not configured?")
+    sys.exit(1)
+inner = dec(outer["token"].split(".")[1])
+print("inner scope  :", inner.get("scope"))
+print("OK")
+'
+```
+
+Expected output ends with `OK`. If `FAIL — no inner token`, your
+connector isn't sending `bearer_access_scope` to STS — see §6.3.
+
+### 5.2 Operator-side catalog request
+
+Ask the Hanka operator to do a catalog request against your connector:
 
 ```bash
 # from a Hanka-side connector:
@@ -297,8 +354,85 @@ curl -X POST <hanka-edc>/management/v3/catalog/request -d '{
 }'
 ```
 
-You should see a JSON catalog response (initially empty, since you haven't published any assets yet). If the request fails:
+You should see a JSON catalog response (initially empty, since you haven't published any assets yet).
 
-1. Check `docker compose logs controlplane` for IATP errors.
-2. Verify your DID document is reachable: `curl https://<their-host>/<your-BPN>/did.json`.
-3. See [`LIMITATIONS.md`](LIMITATIONS.md) for known issues.
+---
+
+## 6. Troubleshooting
+
+Three failure modes you'll see on first contact with the dataspace.
+Each one has a deterministic fingerprint in the logs.
+
+### 6.1 `PKIX path building failed` — TLS chain not trusted
+
+```
+java.security.cert.CertPathBuilderException:
+  unable to find valid certification path to requested target
+```
+
+Your JVM truststore doesn't trust the certificate the operator's
+Credential Service presents. Causes:
+
+- **The operator's cert is signed by a private/self-signed CA.** Ask
+  the operator for the CA root PEM and place it in `config/cacerts/`,
+  then add to the controlplane volumes block in `docker-compose.yaml`:
+  `- ./config/cacerts:/etc/ssl/certs/custom:ro` and an initContainer
+  that imports them. The Hanka preset doesn't currently need this —
+  Hanka's public endpoints use Let's Encrypt, which is in the default
+  JDK truststore.
+- **The cert hostname doesn't match.** Some operators issue
+  internal-only certs for in-cluster traffic but valid LE for external.
+  External operators like you should always see the public cert.
+
+### 6.2 `Name does not resolve` for the operator's DID host
+
+```
+java.net.UnknownHostException: identity-hub.hanka.ai: Name does not resolve
+```
+
+The DID in your `.env` references a hostname that doesn't exist (or
+has been renamed). Re-check `EDC_DID` and `CREDENTIAL_SERVICE_URL`
+against §1.2 — the operator may have changed their public hostname.
+For Hanka the canonical host is `identityhub.hanka.ai` (no dash).
+
+### 6.3 `403 Invalid query: requested Credentials outside of scope`
+
+```
+Unauthorized: Presentation Query failed: HTTP 403,
+  message: "Invalid query: requested Credentials outside of scope."
+```
+
+The IH says: "the token you sent me does not authorize the bearer to
+read these credential types." 99% of the time the cause is the same:
+your connector is not actually applying its DCP `default-scopes`
+config.
+
+Root cause: the EDC environment-variable translator converts `_` →
+`.`, so `TX_EDC_IAM_IATP_DEFAULT_SCOPES_MEMBERSHIP_TYPE` becomes
+`tx.edc.iam.iatp.default.scopes.membership.type` (dotted). The real
+config key is `tx.edc.iam.iatp.default-scopes.membership.type` (with
+a **hyphen** in `default-scopes`), which env vars cannot represent.
+The DCP extension never sees the scopes and mints tokens without a
+nested `bearer_access_scope`.
+
+This repo's `docker-compose.yaml` already mounts
+`config/edc-config.properties` at `/app/configuration.properties` and
+points the EDC at it via `EDC_FS_CONFIG`. If you've forked the
+stack, verify both lines are present in the `controlplane` service
+block. The §5.1 smoke-test catches this directly: when scopes are
+configured, the inner token is non-null.
+
+### 6.4 Catalog comes back but is empty
+
+The credential types the peer requests must match what the operator
+has actually issued into your holder. For Hanka the issued set is
+`MembershipCredential` + `DataExchangeGovernanceCredential`; ask the
+operator to confirm both are present in your holder before debugging
+further. The `config/edc-config.properties` here defines exactly that
+pair — if the operator issues more (or differently named) credential
+types, extend the file accordingly. **Never** request a credential
+type the operator does not issue: the IH returns "more credentials
+requested than returned" and the catalog fails outright.
+
+See also [`LIMITATIONS.md`](LIMITATIONS.md) for known issues that this
+single-node stack will never fix.
